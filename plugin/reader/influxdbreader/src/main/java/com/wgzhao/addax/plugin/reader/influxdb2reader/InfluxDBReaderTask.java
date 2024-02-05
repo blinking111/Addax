@@ -35,18 +35,19 @@ import org.slf4j.LoggerFactory;
 
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.text.SimpleDateFormat;
 import java.time.LocalDateTime;
 import java.time.ZoneOffset;
+import java.util.Date;
 import java.util.List;
 
-public class InfluxDBReaderTask
-{
+public class InfluxDBReaderTask {
     private static final Logger LOG = LoggerFactory.getLogger(InfluxDBReaderTask.class);
 
     private static final int CONNECT_TIMEOUT_SECONDS_DEFAULT = 15;
     private static final int SOCKET_TIMEOUT_SECONDS_DEFAULT = 20;
 
-    private String querySql;
+    private final String querySql;
     private final String database;
     private final String endpoint;
     private final String username;
@@ -55,8 +56,14 @@ public class InfluxDBReaderTask
     private final int connTimeout;
     private final int socketTimeout;
 
-    public InfluxDBReaderTask(Configuration configuration)
-    {
+
+    private final Long startTime;
+
+    private final Long endTime;
+
+    SimpleDateFormat sdf = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss.SSS");
+
+    public InfluxDBReaderTask(Configuration configuration) {
         List<Object> connList = configuration.getList(InfluxDBKey.CONNECTION);
         Configuration conn = Configuration.from(connList.get(0).toString());
         this.querySql = configuration.getString(InfluxDBKey.QUERY_SQL, null);
@@ -66,86 +73,120 @@ public class InfluxDBReaderTask
         this.password = configuration.getString(InfluxDBKey.PASSWORD, null);
         this.connTimeout = configuration.getInt(InfluxDBKey.CONNECT_TIMEOUT_SECONDS, CONNECT_TIMEOUT_SECONDS_DEFAULT) * 1000;
         this.socketTimeout = configuration.getInt(InfluxDBKey.SOCKET_TIMEOUT_SECONDS, SOCKET_TIMEOUT_SECONDS_DEFAULT) * 1000;
+        this.startTime = configuration.getLong("startTime");
+        this.endTime = configuration.getLong("endTime");
     }
 
-    public void post()
-    {
+    public void post() {
         //
     }
 
-    public void destroy()
-    {
+    public void destroy() {
         //
     }
 
-    public void startRead(RecordSender recordSender, TaskPluginCollector taskPluginCollector)
-    {
+    public void startRead(RecordSender recordSender, TaskPluginCollector taskPluginCollector) {
         LOG.info("connect influxdb: {} with username: {}", endpoint, username);
 
         String tail = "/query";
         String enc = "utf-8";
-        String result;
+        String result = null;
+        int offset = 0;
         try {
-            String url = endpoint + tail + "?db=" + URLEncoder.encode(database, enc);
-            if (!"".equals(username)) {
-                url += "&u=" + URLEncoder.encode(username, enc);
-            }
-            if (!"".equals(password)) {
-                url += "&p=" + URLEncoder.encode(password, enc);
-            }
-            if (querySql.contains("#lastMinute#")) {
-                this.querySql = querySql.replace("#lastMinute#", getLastMinute());
-            }
-            url += "&q=" + URLEncoder.encode(querySql, enc);
-            result = get(url);
-        }
-        catch (Exception e) {
-            throw AddaxException.asAddaxException(
-                    InfluxDBReaderErrorCode.ILLEGAL_VALUE, "Failed to get data point！", e);
-        }
+            boolean hasMore = false;
+            int count = 0;
+            int seriesCount = 0;
+            do {
+                hasMore = false;
+                String url = endpoint + tail + "?db=" + URLEncoder.encode(database, enc);
+                if (!"".equals(username)) {
+                    url += "&u=" + URLEncoder.encode(username, enc);
+                }
+                if (!"".equals(password)) {
+                    url += "&p=" + URLEncoder.encode(password, enc);
+                }
+                url += "&epoch=ms";
+//            if (querySql.contains("#lastMinute#")) {
+//                this.querySql = querySql.replace("#lastMinute#", getLastMinute());
+//            }
+                String querySql= this.querySql;
+                if (querySql.contains("#startTime#")) {
+                    querySql = querySql.replace("#startTime#", sdf.format(new Date(startTime)));
+                }
+                if (querySql.contains("#endTime#")) {
+                    querySql = querySql.replace("#endTime#", sdf.format(new Date(endTime)));
+                }
+                if (querySql.contains("#offset#")) {
+                    querySql = querySql.replace("#offset#", String.valueOf(offset));
+                }
 
-        if (StringUtils.isBlank(result)) {
-            throw AddaxException.asAddaxException(
-                    InfluxDBReaderErrorCode.ILLEGAL_VALUE, "Get nothing!", null);
-        }
-        try {
-            JSONObject jsonObject = JSONObject.parseObject(result);
-            JSONArray results = (JSONArray) jsonObject.get("results");
-            JSONObject resultsMap = (JSONObject) results.get(0);
-            if (resultsMap.containsKey("series")) {
-                JSONArray series = (JSONArray) resultsMap.get("series");
-                JSONObject seriesMap = (JSONObject) series.get(0);
-                if (seriesMap.containsKey("values")) {
-                    JSONArray values = (JSONArray) seriesMap.get("values");
-                    for (Object row : values) {
-                        JSONArray rowArray = (JSONArray) row;
-                        Record record = recordSender.createRecord();
-                        for (Object s : rowArray) {
-                            if (null != s) {
-                                record.addColumn(new StringColumn(s.toString()));
-                            }
-                            else {
-                                record.addColumn(new StringColumn());
+                url += "&q=" + URLEncoder.encode(querySql, enc);
+                result = get(url);
+                if (StringUtils.isBlank(result)) {
+//            throw AddaxException.asAddaxException(
+//                    InfluxDBReaderErrorCode.ILLEGAL_VALUE, "Get nothing!", null);
+                    LOG.error("Get nothing!");
+                }
+                try {
+                    JSONObject jsonObject = JSONObject.parseObject(result);
+                    JSONArray results = (JSONArray) jsonObject.get("results");
+                    JSONObject resultsMap = (JSONObject) results.get(0);
+                    if (resultsMap.containsKey("series")) {
+                        JSONArray series = (JSONArray) resultsMap.get("series");
+                        for (Object o : series) {
+                            seriesCount++;
+                            JSONObject seriesMap = (JSONObject) o;
+                            if (seriesMap.containsKey("values")) {
+                                JSONArray values = (JSONArray) seriesMap.get("values");
+                                for (Object row : values) {
+                                    JSONArray rowArray = (JSONArray) row;
+                                    Record record = recordSender.createRecord();
+                                    int j = 0;
+                                    for (Object s : rowArray) {
+                                        if (null != s) {
+                                            //时间戳转换
+                                            if (j == 0) {
+                                                record.addColumn(new StringColumn(sdf.format(new Date(Long.parseLong(s.toString())))));
+                                            } else {
+                                                record.addColumn(new StringColumn(s.toString()));
+                                            }
+                                        } else {
+                                            record.addColumn(new StringColumn());
+                                        }
+                                        j++;
+                                    }
+                                    hasMore = true;
+                                    count++;
+                                    recordSender.sendToWriter(record);
+                                }
                             }
                         }
-                        recordSender.sendToWriter(record);
+                    } else if (resultsMap.containsKey("error")) {
+//                throw AddaxException.asAddaxException(
+//                        InfluxDBReaderErrorCode.ILLEGAL_VALUE, "Error occurred in data sets！", null);
+                        LOG.error("Error occurred in data sets！result:{}", result);
                     }
+                } catch (Exception e) {
+//            throw AddaxException.asAddaxException(
+//                    InfluxDBReaderErrorCode.ILLEGAL_VALUE, "Failed to send data", e);
+                    LOG.error("Failed to send data", e);
                 }
-            }
-            else if (resultsMap.containsKey("error")) {
-                throw AddaxException.asAddaxException(
-                        InfluxDBReaderErrorCode.ILLEGAL_VALUE, "Error occurred in data sets！", null);
-            }
+                offset++;
+                LOG.info("当前时间：" + sdf.format(new Date(startTime)) + "当前位移：" + offset + "是否有下一次请求：" + hasMore + "当前条数：" + count + "当前处理seiies数：" + seriesCount);
+            } while (hasMore);
+
+
+        } catch (Exception e) {
+//            throw AddaxException.asAddaxException(
+//                    InfluxDBReaderErrorCode.ILLEGAL_VALUE, "Failed to get data point！", e);
+            LOG.error("Failed to get data point！", e);
         }
-        catch (Exception e) {
-            throw AddaxException.asAddaxException(
-                    InfluxDBReaderErrorCode.ILLEGAL_VALUE, "Failed to send data", e);
-        }
+
+
     }
 
     public String get(String url)
-            throws Exception
-    {
+            throws Exception {
         Content content = Request.Get(url)
                 .connectTimeout(this.connTimeout)
                 .socketTimeout(this.socketTimeout)
@@ -158,8 +199,7 @@ public class InfluxDBReaderTask
     }
 
     @SuppressWarnings("JavaTimeDefaultTimeZone")
-    private String getLastMinute()
-    {
+    private String getLastMinute() {
         long lastMinuteMilli = LocalDateTime.now().plusMinutes(-1).toInstant(ZoneOffset.of("+8")).toEpochMilli();
         return String.valueOf(lastMinuteMilli);
     }

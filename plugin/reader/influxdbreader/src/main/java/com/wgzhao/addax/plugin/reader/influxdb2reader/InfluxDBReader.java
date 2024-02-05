@@ -25,6 +25,7 @@ import com.wgzhao.addax.common.spi.Reader;
 import com.wgzhao.addax.common.util.Configuration;
 import org.apache.commons.lang3.StringUtils;
 
+import java.sql.SQLOutput;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -68,9 +69,22 @@ public class InfluxDBReader
         @Override
         public List<Configuration> split(int adviceNumber)
         {
+            System.out.println("adviceNumber: " + adviceNumber);
             Configuration readerSliceConfig = super.getPluginJobConf();
+            //获取输入的时间间隔
+            String startTime = readerSliceConfig.getString("startTime");
+            String endTime = readerSliceConfig.getString("endTime");
+            //计算两个时间间隔的天数
+            int days = (int) ((Long.parseLong(endTime) - Long.parseLong(startTime)) / (1000 * 3600 * 24));
             List<Configuration> splitConfigs = new ArrayList<>();
-            splitConfigs.add(readerSliceConfig);
+            //添加每天的任务
+            for (int i = 0; i < days; i++) {
+                Configuration tempConfig = readerSliceConfig.clone();
+                long startTimeLong = Long.parseLong(startTime) + (long) i * 24 * 3600 * 1000;
+                tempConfig.set("startTime", startTimeLong);
+                tempConfig.set("endTime",startTimeLong+ 24 * 3600 * 1000);
+                splitConfigs.add(tempConfig);
+            }
             return splitConfigs;
         }
 
